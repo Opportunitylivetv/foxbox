@@ -2,8 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use ipc_channel::ipc::{ self, IpcOneShotServer, IpcReceiver, IpcSender };
-
 // Assumes Unix
 use libc::{self,  c_int};
 
@@ -15,12 +13,28 @@ use std::process::Child;
 use std::io::{ Error, ErrorKind, Result };
 
 use backoff::Backoff;
-
-/// Unix exit statuses
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
-pub struct ExitStatus(c_int);
+use traits::{ ChildProcess, ExitStatus };
+use utils::*;
 
 const RESTART_TIME_THRESHOLD: u64 = 5; // seconds
+
+impl ChildProcess for Child {
+    fn id(&self) -> u32 {
+        Child::id(self)
+    }
+
+    fn wait(&mut self) -> Result<ExitStatus> {
+        let exit_status = try!(Child::wait(self));
+
+        if let Some(status) = exit_status.code() {
+            Ok(ExitStatus(status))
+        } else {
+            // None zero because std::process::ExitStatus::code returns
+            // None if the process was terminated by a signal
+            Ok(ExitStatus(1))
+        }
+    }
+}
 
 pub struct ManagedProcess {
     kill_signal: Arc<Mutex<u32>>,
@@ -29,42 +43,7 @@ pub struct ManagedProcess {
     backoff:     Arc<RwLock<Backoff>>,
 }
 
-pub unsafe fn fork<F: FnOnce()>(child: F) -> Result<libc::pid_t> {
-    match libc::fork() {
-        -1 => Err(Error::last_os_error()),
-        0  => { child();  unreachable!() },
-        pid => Ok(pid)
-    }
-}
-
 impl ManagedProcess {
-
-    pub fn fork_start<T, F>(f: F) -> Result<()>
-        where T: Deserialize + Serialize,
-              F: Fn(IpcSender<T>, IpcReceiver<T>) -> Result<()> + Send {
-
-        let (server, server_name): (IpcOneShotServer<T>, String) = IpcOneShotServer::new().unwrap();
-        let child_pid = unsafe { fork(|| {
-            // Create process local receiver and sender.
-            let (tx, rx): (IpcSender<T>, IpcReceiver<T>) = ipc::channel().unwrap();
-
-            // Connect to the parent process and send the local sender
-            let server_tx = IpcSender::connect(server_name.clone()).unwrap();
-            server_tx.send(tx).unwrap();
-
-            let tx = IpcSender::connect(server_name).unwrap();
-
-            if let Err(e) = f(tx, rx) {
-                error!("Process didn't exit cleanly: {}", e);
-                // TODO: Use an exit status?
-                libc::exit(1);
-            } else {
-                libc::exit(0);
-            }
-        }) };
-
-        Ok(())
-    }
 
     /// Create a new ManagedProcess and start it.
     ///
@@ -82,8 +61,9 @@ impl ManagedProcess {
     /// });
     ///
     /// ```
-    pub fn start<F: 'static>(spawn: F) -> Result<ManagedProcess>
-        where F: Fn() -> Result<Child> + Send {
+    pub fn start<TChild, F: 'static>(spawn: F) -> Result<ManagedProcess>
+        where TChild: ChildProcess,
+              F: Fn() -> Result<TChild> + Send {
 
         let pid = Arc::new(Mutex::new(None));
 
@@ -215,42 +195,6 @@ impl ManagedProcess {
     }
 }
 
-/// A non-blocking 'wait' for a given process id.
-fn try_wait(id: i32) -> Result<Option<ExitStatus>> {
-    let mut status = 0 as c_int;
-
-    match c_rv_retry(|| unsafe {
-        libc::waitpid(id, &mut status, libc::WNOHANG)
-    }) {
-        Ok(0)  => Ok(None),
-        Ok(n) if n == id => Ok(Some(ExitStatus(status))),
-        Ok(n)  => Err(Error::new(ErrorKind::NotFound, format!("Unknown pid: {}", n))),
-        Err(e) => Err(Error::new(ErrorKind::Other, format!("Unknown waitpid error: {}", e)))
-    }
-}
-
-/// Check the return value of libc function and turn it into a
-/// Result type
-fn c_rv(t: c_int) -> Result<c_int> {
-    if t == -1 {
-        Err(Error::last_os_error())
-    } else {
-        Ok(t)
-    }
-}
-
-/// Check the return value of a libc function, but, retry the given function if
-/// the returned error is EINTR (Interrupted)
-fn c_rv_retry<F>(mut f: F) -> Result<c_int>
-    where F: FnMut() -> c_int
-{
-    loop {
-        match c_rv(f()) {
-            Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
-            other => return other,
-        }
-    }
-}
 
 
 #[test]

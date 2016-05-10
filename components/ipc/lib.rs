@@ -25,5 +25,9 @@ macro_rules! checklock (
 
 mod backoff;
 mod managed_process;
+mod traits;
+mod process;
+mod utils;
 
 pub use managed_process::*;
+pub use process::*;
