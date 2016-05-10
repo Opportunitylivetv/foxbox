@@ -1,0 +1,17 @@
+[package]
+name = "ipc"
+version = "0.1.0"
+authors = ["The Project Link Developers"]
+publish = false
+
+[lib]
+name = "ipc"
+path = "lib.rs"
+
+[dependencies]
+clippy = "0.0.64"
+ipc-channel = { git = "https://github.com/servo/ipc-channel.git", rev= "792e79"}
+libc = "0.2.7"
+log = "0.3"
+serde = "0.7.0"
+serde_json = "0.7.0"

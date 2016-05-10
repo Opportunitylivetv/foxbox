@@ -2,15 +2,19 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+use ipc_channel::ipc::{ self, IpcOneShotServer, IpcReceiver, IpcSender };
+
 // Assumes Unix
 use libc::{self,  c_int};
 
+use serde::{ Deserialize, Serialize };
 use std::thread;
 use std::thread::JoinHandle;
 use std::sync::{ Arc, Mutex, RwLock };
 use std::process::Child;
 use std::io::{ Error, ErrorKind, Result };
-use std::time::{ Duration, Instant };
+
+use backoff::Backoff;
 
 /// Unix exit statuses
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -25,65 +29,49 @@ pub struct ManagedProcess {
     backoff:     Arc<RwLock<Backoff>>,
 }
 
-struct Backoff {
-    restart_count: u64,
-    restart_threshold: Duration,
-    start_time: Option<Instant>,
-    backoff: u64,
-}
-
-impl Backoff {
-
-    fn new(restart_threshold: Duration) -> Self {
-        Backoff {
-            restart_count: 0,
-            restart_threshold: restart_threshold,
-            start_time: None,
-            backoff: 1,
-        }
-    }
-
-    fn from_secs(restart_threshold_secs: u64) -> Self {
-        Backoff::new(Duration::from_secs(restart_threshold_secs))
-    }
-
-    fn next_backoff(&mut self) -> Duration {
-        let end_time = Instant::now();
-
-        let duration_to_backoff =
-            if let Some(start_time) = self.start_time {
-                if (end_time - start_time) < self.restart_threshold {
-                    self.backoff += 1;
-
-                    // non-linear back off
-                    Duration::from_secs((self.backoff * self.backoff) >> 1)
-                } else {
-                    self.backoff = 1;
-                    Duration::from_secs(0)
-                }
-            } else {
-                Duration::from_secs(0)
-            };
-
-        self.restart_count += 1;
-        self.start_time = Some(Instant::now());
-
-        duration_to_backoff
-    }
-
-    pub fn get_restart_count(&self) -> u64 {
-        self.restart_count
+pub unsafe fn fork<F: FnOnce()>(child: F) -> Result<libc::pid_t> {
+    match libc::fork() {
+        -1 => Err(Error::last_os_error()),
+        0  => { child();  unreachable!() },
+        pid => Ok(pid)
     }
 }
 
 impl ManagedProcess {
+
+    pub fn fork_start<T, F>(f: F) -> Result<()>
+        where T: Deserialize + Serialize,
+              F: Fn(IpcSender<T>, IpcReceiver<T>) -> Result<()> + Send {
+
+        let (server, server_name): (IpcOneShotServer<T>, String) = IpcOneShotServer::new().unwrap();
+        let child_pid = unsafe { fork(|| {
+            // Create process local receiver and sender.
+            let (tx, rx): (IpcSender<T>, IpcReceiver<T>) = ipc::channel().unwrap();
+
+            // Connect to the parent process and send the local sender
+            let server_tx = IpcSender::connect(server_name.clone()).unwrap();
+            server_tx.send(tx).unwrap();
+
+            let tx = IpcSender::connect(server_name).unwrap();
+
+            if let Err(e) = f(tx, rx) {
+                error!("Process didn't exit cleanly: {}", e);
+                // TODO: Use an exit status?
+                libc::exit(1);
+            } else {
+                libc::exit(0);
+            }
+        }) };
+
+        Ok(())
+    }
 
     /// Create a new ManagedProcess and start it.
     ///
     /// # Examples
     ///
     /// ```
-    /// use tunnel_controller::ManagedProcess;
+    /// use ipc::ManagedProcess;
     /// use std::process::Command;
     ///
     /// let process = ManagedProcess::start(|| {
@@ -160,7 +148,7 @@ impl ManagedProcess {
     /// # Examples
     ///
     /// ```
-    /// use tunnel_controller::ManagedProcess;
+    /// use ipc::ManagedProcess;
     /// use std::process::Command;
     ///
     /// let process = ManagedProcess::start(|| {
@@ -169,7 +157,7 @@ impl ManagedProcess {
     ///             .spawn()
     /// });
     ///
-    /// process.shutdown().unwrap();
+    /// process.unwrap().shutdown().unwrap();
     ///
     /// ```
     pub fn shutdown(self) -> Result<()> {
@@ -264,54 +252,10 @@ fn c_rv_retry<F>(mut f: F) -> Result<c_int>
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::Backoff;
-    use std::thread;
-    use std::time::Duration;
-
-    #[test]
-    fn test_backoff_immediate_if_failed_after_threshold() {
-
-        let mut backoff = Backoff::from_secs(2);
-        assert_eq!(backoff.next_backoff().as_secs(), 0);
-
-        // Simulate process running
-        thread::sleep(Duration::new(4, 0));
-
-        assert_eq!(backoff.next_backoff().as_secs(), 0);
-    }
-
-    #[test]
-    fn test_backoff_wait_if_failed_before_threshold() {
-        let mut backoff = Backoff::from_secs(1);
-        assert_eq!(backoff.next_backoff().as_secs(), 0);
-
-        assert_eq!(backoff.next_backoff().as_secs(), 2);
-        assert_eq!(backoff.next_backoff().as_secs(), 4);
-        assert_eq!(backoff.next_backoff().as_secs(), 8);
-        assert_eq!(backoff.next_backoff().as_secs(), 12);
-        assert_eq!(backoff.next_backoff().as_secs(), 18);
-        assert_eq!(backoff.next_backoff().as_secs(), 24);
-    }
-
-    #[test]
-    fn test_backoff_reset_if_running_for_more_than_threshold() {
-        let mut backoff = Backoff::from_secs(1);
-        assert_eq!(backoff.next_backoff().as_secs(), 0);
-        assert_eq!(backoff.next_backoff().as_secs(), 2);
-        assert_eq!(backoff.next_backoff().as_secs(), 4);
-        assert_eq!(backoff.next_backoff().as_secs(), 8);
-
-        // Simulate process running
-        thread::sleep(Duration::new(3, 0));
-
-        assert_eq!(backoff.next_backoff().as_secs(), 0);
-    }
-}
 
 #[test]
 fn test_managed_process_restart() {
+    use std::time::Duration;
     use std::process::Command;
 
     let process = ManagedProcess::start(|| {
@@ -328,7 +272,7 @@ fn test_managed_process_restart() {
             panic!("Process has not restarted twice, within the expected amount of time");
         } else {
             spin_count += 1;
-            thread::sleep(Duration::new(3, 0));
+            thread::sleep(Duration::from_secs(3));
         }
     }
 

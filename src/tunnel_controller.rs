@@ -7,7 +7,7 @@ use std::io::prelude::*;
 use std::process::{ Child, Command };
 use std::io::Result;
 use url::{ SchemeData, Url };
-use managed_process::ManagedProcess;
+use ipc::ManagedProcess;
 
 pub type TunnelProcess = ManagedProcess;
 

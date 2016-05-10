@@ -36,6 +36,7 @@ extern crate iron;
 extern crate iron_cors;
 #[cfg(test)]
 extern crate iron_test;
+extern crate ipc;
 extern crate libc;
 #[macro_use]
 extern crate log;
@@ -77,7 +78,6 @@ mod adapters;
 mod config_store;
 mod controller;
 mod http_server;
-mod managed_process;
 mod profile_service;
 mod registration;
 mod upnp;
